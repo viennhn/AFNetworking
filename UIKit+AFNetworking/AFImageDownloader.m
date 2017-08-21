@@ -28,6 +28,7 @@
 
 @interface AFImageDownloaderResponseHandler : NSObject
 @property (nonatomic, strong) NSUUID *uuid;
+@property (nonatomic, copy) void (^downloadProgressBlock)(NSProgress*);
 @property (nonatomic, copy) void (^successBlock)(NSURLRequest*, NSHTTPURLResponse*, UIImage*);
 @property (nonatomic, copy) void (^failureBlock)(NSURLRequest*, NSHTTPURLResponse*, NSError*);
 @end
@@ -35,15 +36,18 @@
 @implementation AFImageDownloaderResponseHandler
 
 - (instancetype)initWithUUID:(NSUUID *)uuid
+                    progress:(nullable void (^)(NSProgress *downloadProgress))downloadProgressBlock
                      success:(nullable void (^)(NSURLRequest *request, NSHTTPURLResponse * _Nullable response, UIImage *responseObject))success
                      failure:(nullable void (^)(NSURLRequest *request, NSHTTPURLResponse * _Nullable response, NSError *error))failure {
     if (self = [self init]) {
         self.uuid = uuid;
+        self.downloadProgressBlock = downloadProgressBlock;
         self.successBlock = success;
         self.failureBlock = failure;
     }
     return self;
 }
+
 
 - (NSString *)description {
     return [NSString stringWithFormat: @"<AFImageDownloaderResponseHandler>UUID: %@", [self.uuid UUIDString]];
@@ -196,6 +200,11 @@
                                                   withReceiptID:(nonnull NSUUID *)receiptID
                                                         success:(nullable void (^)(NSURLRequest *request, NSHTTPURLResponse  * _Nullable response, UIImage *responseObject))success
                                                         failure:(nullable void (^)(NSURLRequest *request, NSHTTPURLResponse * _Nullable response, NSError *error))failure {
+    return [self downloadImageForURLRequest:request withReceiptID:receiptID progress:nil success:success failure:failure];
+}
+
+-(AFImageDownloadReceipt *)downloadImageForURLRequest:(NSURLRequest *)request withReceiptID:(NSUUID *)receiptID progress:(void (^)(NSProgress * _Nonnull))downloadProgressBlock success:(void (^)(NSURLRequest * _Nonnull, NSHTTPURLResponse * _Nullable, UIImage * _Nonnull))success failure:(void (^)(NSURLRequest * _Nonnull, NSHTTPURLResponse * _Nullable, NSError * _Nonnull))failure {
+    
     __block NSURLSessionDataTask *task = nil;
     dispatch_sync(self.synchronizationQueue, ^{
         NSString *URLIdentifier = request.URL.absoluteString;
@@ -208,16 +217,16 @@
             }
             return;
         }
-
+        
         // 1) Append the success and failure blocks to a pre-existing request if it already exists
         AFImageDownloaderMergedTask *existingMergedTask = self.mergedTasks[URLIdentifier];
         if (existingMergedTask != nil) {
-            AFImageDownloaderResponseHandler *handler = [[AFImageDownloaderResponseHandler alloc] initWithUUID:receiptID success:success failure:failure];
+            AFImageDownloaderResponseHandler *handler = [[AFImageDownloaderResponseHandler alloc] initWithUUID:receiptID progress:downloadProgressBlock success:success failure:failure];
             [existingMergedTask addResponseHandler:handler];
             task = existingMergedTask.task;
             return;
         }
-
+        
         // 2) Attempt to load the image from the image cache if the cache policy allows it
         switch (request.cachePolicy) {
             case NSURLRequestUseProtocolCachePolicy:
@@ -237,16 +246,29 @@
             default:
                 break;
         }
-
+        
         // 3) Create the request and set up authentication, validation and response serialization
         NSUUID *mergedTaskIdentifier = [NSUUID UUID];
         NSURLSessionDataTask *createdTask;
         __weak __typeof__(self) weakSelf = self;
-
+        
         createdTask = [self.sessionManager
                        dataTaskWithRequest:request
                        uploadProgress:nil
-                       downloadProgress:nil
+                       downloadProgress:^(NSProgress * _Nonnull downloadProgress) {
+                           dispatch_async(self.responseQueue, ^{
+                               AFImageDownloaderMergedTask *mergedTask = self.mergedTasks[URLIdentifier];
+                               if ([mergedTask.identifier isEqual:mergedTaskIdentifier]) {
+                                   for (AFImageDownloaderResponseHandler *handler in mergedTask.responseHandlers) {
+                                       if (handler.downloadProgressBlock) {
+                                           dispatch_async(dispatch_get_main_queue(), ^{
+                                               handler.downloadProgressBlock(downloadProgress);
+                                           });
+                                       }
+                                   }
+                               }
+                           });
+                       }
                        completionHandler:^(NSURLResponse * _Nonnull response, id  _Nullable responseObject, NSError * _Nullable error) {
                            dispatch_async(self.responseQueue, ^{
                                __strong __typeof__(weakSelf) strongSelf = weakSelf;
@@ -263,7 +285,7 @@
                                        }
                                    } else {
                                        [strongSelf.imageCache addImage:responseObject forRequest:request withAdditionalIdentifier:nil];
-
+                                       
                                        for (AFImageDownloaderResponseHandler *handler in mergedTask.responseHandlers) {
                                            if (handler.successBlock) {
                                                dispatch_async(dispatch_get_main_queue(), ^{
@@ -278,25 +300,28 @@
                                [strongSelf safelyStartNextTaskIfNecessary];
                            });
                        }];
-
+        
         // 4) Store the response handler for use when the request completes
-        AFImageDownloaderResponseHandler *handler = [[AFImageDownloaderResponseHandler alloc] initWithUUID:receiptID
-                                                                                                   success:success
-                                                                                                   failure:failure];
+        AFImageDownloaderResponseHandler *handler = [[AFImageDownloaderResponseHandler alloc]
+                                                     initWithUUID:receiptID
+                                                     progress:downloadProgressBlock
+                                                     success:success
+                                                     failure:failure];
+        
         AFImageDownloaderMergedTask *mergedTask = [[AFImageDownloaderMergedTask alloc]
                                                    initWithURLIdentifier:URLIdentifier
                                                    identifier:mergedTaskIdentifier
                                                    task:createdTask];
         [mergedTask addResponseHandler:handler];
         self.mergedTasks[URLIdentifier] = mergedTask;
-
+        
         // 5) Either start the request or enqueue it depending on the current active request count
         if ([self isActiveRequestCountBelowMaximumLimit]) {
             [self startMergedTask:mergedTask];
         } else {
             [self enqueueMergedTask:mergedTask];
         }
-
+        
         task = mergedTask.task;
     });
     if (task) {
@@ -305,6 +330,7 @@
         return nil;
     }
 }
+
 
 - (void)cancelTaskForImageDownloadReceipt:(AFImageDownloadReceipt *)imageDownloadReceipt {
     dispatch_sync(self.synchronizationQueue, ^{
