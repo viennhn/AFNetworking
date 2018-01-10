@@ -139,7 +139,7 @@
 
     configuration.requestCachePolicy = NSURLRequestUseProtocolCachePolicy;
     configuration.allowsCellularAccess = YES;
-    configuration.timeoutIntervalForRequest = 60.0;
+    configuration.timeoutIntervalForRequest = 30.0;
     configuration.URLCache = [AFImageDownloader defaultURLCache];
 
     return configuration;
@@ -152,7 +152,7 @@
 
     return [self initWithSessionManager:sessionManager
                  downloadPrioritization:AFImageDownloadPrioritizationFIFO
-                 maximumActiveDownloads:4
+                 maximumActiveDownloads:5
                              imageCache:[[AFAutoPurgingImageCache alloc] init]];
 }
 
